@@ -98,10 +98,10 @@ The performance-critical heart of the system. Maintains memory-aligned vector ar
 
 > **HNSW Vector Compute Dash** — SIMD Accelerated Real-Time Node Analytics Terminal
 
-<img width="3438" height="1312" alt="Screenshot 2026-05-17 at 11 56 03 PM" src="https://github.com/user-attachments/assets/aa91615a-690c-4779-84fd-cbd6a5fbc0ff" />
+<img width="3438" height="1312" alt="Screenshot 2026-05-17 at 11 56 03 PM" src="https://github.com/user-attachments/assets/06e74ae8-1a04-46e3-8e05-d122c04aeba3" />
 
 
-*Live query: `"distributed microservices and kafka brokers"` — returning Top 4 KNN results with cosine distance values, alongside a 2D spine projection of the local base-layer graph connections. Avg query latency: **0.525ms** · P95 tail: **7.93ms** · Throughput: **1904 QPS**.*
+*Live query: `"distributed microservices and kafka brokers"` — returning Top 4 KNN results with cosine distance values, alongside a 2D spine projection of the local base-layer graph connections. Avg query latency: **0.496ms** · P95 tail: **7.93ms** · Throughput: **2014 QPS**.*
 
 ---
 

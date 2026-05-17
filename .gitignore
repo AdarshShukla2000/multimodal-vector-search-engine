@@ -1,0 +1,25 @@
+# Node.js
+node_modules/
+.next/
+dist/
+npm-debug.log*
+
+# Java / Maven
+target/
+*.jar
+*.war
+*.class
+.mvn/
+.idea/
+*.iml
+
+# C++ Build Artefacts
+*.o
+*.out
+build/
+.vscode/
+.DS_Store
+
+# Infrastructure Secrets / Cache
+.env
+dump.rdb

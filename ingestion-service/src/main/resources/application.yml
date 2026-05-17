@@ -1,0 +1,16 @@
+server:
+  port: 8081
+
+spring:
+  application:
+    name: ingestion-service
+  kafka:
+    bootstrap-servers: localhost:9092
+    consumer:
+      group-id: vector-ingestion-workers-v3   # <-- Incremented to force a fresh group status
+      auto-offset-reset: latest              # <-- Dictates behavior for the new group name
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      max-poll-records: 500
+      properties:
+        spring.json.trusted.packages: "*"

@@ -1,0 +1,41 @@
+syntax = "proto3";
+
+package vector_service;
+
+option java_multiple_files = true;
+option java_package = "com.search.engine.grpc";
+
+service VectorComputeEngine {
+  rpc IngestVectorStream (VectorMessage) returns (IngestResponse);
+  
+  // NEW: Query retrieval service method
+  rpc QueryNearestNeighbors (QueryRequest) returns (QueryResponse);
+}
+
+message VectorMessage {
+  int64 id = 1;
+  repeated float values = 2;
+}
+
+message IngestResponse {
+  string status = 1;
+  string message = 2;
+}
+
+// NEW: Request payload containing the query embedding and target K size
+message QueryRequest {
+  repeated float query_vector = 1;
+  int32 top_k = 2;
+}
+
+// NEW: Singular matching item entry structure
+message SearchMatch {
+  int64 id = 1;
+  float distance = 2;
+}
+
+// NEW: Array containing all matching search results
+message QueryResponse {
+  string status = 1;
+  repeated SearchMatch matches = 2;
+}

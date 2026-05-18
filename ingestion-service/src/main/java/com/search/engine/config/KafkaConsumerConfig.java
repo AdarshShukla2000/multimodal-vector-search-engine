@@ -17,15 +17,14 @@ public class KafkaConsumerConfig {
         ConcurrentKafkaListenerContainerFactory<String, String> factory = 
                 new ConcurrentKafkaListenerContainerFactory<>();
         
-        // Injecting the auto-configured consumer factory built from your application.yml
         factory.setConsumerFactory(consumerFactory);
         
-        // CRITICAL FIX: Enable multi-record batch processing mode.
-        // This stops Spring from parsing a single string payload into a list of comma-separated chunks.
-        factory.setBatchListener(true); 
+        // ✅ FIXED: Record mode required for @RetryableTopic compatibility.
+        // Your consumer method signature (String record) is already record-mode —
+        // batch mode was never needed here and directly caused the startup crash.
+        factory.setBatchListener(false);
         
-        // Multi-threaded consumption processing
-        // Spawns concurrent worker threads to pull from multiple topic partitions parallelly
+        // Multi-threaded partition consumption
         factory.setConcurrency(3); 
         
         return factory;

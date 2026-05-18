@@ -1,0 +1,52 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: core-engine-deployment
+  namespace: default
+  labels:
+    app: core-engine
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: core-engine
+  template:
+    metadata:
+      labels:
+        app: core-engine
+    spec:
+      containers:
+      - name: hsnw-core-core
+        image: multimodal-search/core-engine:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 50051
+          name: grpc-port
+        # Explicit resource enforcement to protect your hardware runtime environment
+        resources:
+          limits:
+            cpu: "2"
+            memory: 4Gi
+          requests:
+            cpu: "1"
+            memory: 2Gi
+        readinessProbe:
+          tcpSocket:
+            port: 50051
+          initialDelaySeconds: 5
+          periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: core-engine-service
+  namespace: default
+spec:
+  type: ClusterIP
+  ports:
+  - port: 50051
+    targetPort: 50051
+    protocol: TCP
+    name: grpc
+  selector:
+    app: core-engine

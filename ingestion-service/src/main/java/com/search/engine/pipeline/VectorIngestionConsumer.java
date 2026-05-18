@@ -10,6 +10,8 @@ import com.search.engine.grpc.IngestResponse;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.kafka.annotation.KafkaListener;
+import org.springframework.kafka.annotation.RetryableTopic;
+import org.springframework.retry.annotation.Backoff;
 import org.springframework.stereotype.Service;
 
 import jakarta.annotation.PostConstruct;
@@ -17,8 +19,7 @@ import jakarta.annotation.PreDestroy;
 import java.util.ArrayList;
 import java.util.List;
 
-// 🛑 COMMENTED OUT: Tells Spring Framework to ignore this class completely during the container scan phase
-// @Service
+@Service // 🚀 Activated back into the Spring Context
 public class VectorIngestionConsumer {
 
     private static final Logger log = LoggerFactory.getLogger(VectorIngestionConsumer.class);
@@ -27,87 +28,73 @@ public class VectorIngestionConsumer {
     private ManagedChannel channel;
     private VectorComputeEngineGrpc.VectorComputeEngineBlockingStub blockingStub;
 
-    /**
-     * @brief Establishes a persistent RPC connection loopback channel to our native C++ server.
-     */
     @PostConstruct
     public void initGrpcClient() {
-        log.info("Initializing Low-Latency IPC loopback socket to C++ Compute Engine...");
+        log.info("Initializing Enterprise IPC loopback socket to C++ Compute Core...");
         this.channel = ManagedChannelBuilder.forAddress("localhost", 50051)
-                .usePlaintext() // Local network channel loopback optimization
+                .usePlaintext() 
                 .build();
         this.blockingStub = VectorComputeEngineGrpc.newBlockingStub(channel);
     }
 
     /**
-     * @brief Concurrently consumes high-throughput batch vectors out of Apache Kafka.
-     * 🛑 COMMENTED OUT: Stops this worker loop thread pool from contending with the Node gateway for the Kafka stream.
+     * @brief Concurrently consumes single streaming records from Kafka.
+     * Aligns perfectly with Spring Retryable Topics for automated exponential backoff and DLT routing.
      */
-    // @KafkaListener(
-    //     topics = "vector-ingestion-stream", 
-    //     containerFactory = "kafkaListenerContainerFactory"
-    // )
-    public void consumeVectorBatch(List<String> messageBatch) {
+    @RetryableTopic(
+        attempts = "3",
+        backoff = @Backoff(delay = 1000, multiplier = 2.0),
+        dltTopicSuffix = "-dlt"
+    )
+    @KafkaListener(
+        topics = "vector-ingestion-stream", 
+        containerFactory = "kafkaListenerContainerFactory"
+    )
+    public void consumeVectorRecord(String record) {
         long startTime = System.currentTimeMillis();
-        log.info("Received execution batch chunk from Kafka. Size: {} records.", messageBatch.size());
+        log.debug("📊 Processing incoming streaming message payload.");
 
-        for (String record : messageBatch) {
-            try {
-                // 1. Safe parsing encapsulation
-                JsonNode jsonNode = objectMapper.readTree(record);
-                
-                // 2. Structural Defensive Validation: Ensure root node and mandatory fields exist
-                if (jsonNode == null || !jsonNode.has("id") || !jsonNode.has("vector")) {
-                    log.warn("Skipping structurally incomplete or corrupt message packet. Value: {}", record);
-                    continue; 
-                }
-
-                long vectorId = jsonNode.get("id").asLong();
-                JsonNode vectorArray = jsonNode.get("vector");
-                
-                // 3. Type Validation: Ensure 'vector' field is actually an accessible JSON array
-                if (vectorArray == null || !vectorArray.isArray()) {
-                    log.warn("Skipping record ID {}: 'vector' field is missing or not a valid JSON array.", vectorId);
-                    continue;
-                }
-
-                List<Float> floatValues = new ArrayList<>(vectorArray.size());
-                for (int i = 0; i < vectorArray.size(); i++) {
-                    JsonNode element = vectorArray.get(i);
-                    if (element != null && element.isNumber()) {
-                        floatValues.add((float) element.asDouble());
-                    } else {
-                        log.warn("Non-numeric value encountered at index {} for vector ID {}. Defaulting to 0.0f.", i, vectorId);
-                        floatValues.add(0.0f);
-                    }
-                }
-
-                // --- PIPELINE STEP: Native Handshake Execution Boundary ---
-                VectorMessage vectorMessage = VectorMessage.newBuilder()
-                        .setId(vectorId)
-                        .addAllValues(floatValues)
-                        .build();
-
-                // Dispatch over our ultra-low latency local gRPC socket channel
-                IngestResponse response = blockingStub.ingestVectorStream(vectorMessage);
-                
-                log.debug("Native core response status: {} for node ID: {}", response.getStatus(), vectorId);
-
-            } catch (com.fasterxml.jackson.core.JsonProcessingException e) {
-                log.error("Poison pill ignored. Failed to parse string payload into valid JSON tree structure. Error: {}", e.getMessage());
-            } catch (Exception e) {
-                log.error("Pipeline degradation: Failed to forward vector data to C++ compute layer", e);
+        try {
+            JsonNode jsonNode = objectMapper.readTree(record);
+            
+            if (jsonNode == null || !jsonNode.has("id") || !jsonNode.has("vector")) {
+                log.warn("Malformed packet encountered. Routing out of core loop.");
+                return; 
             }
-        }
 
-        long processingDuration = System.currentTimeMillis() - startTime;
-        log.info("Batch computation ingestion loop finished in {} ms.", processingDuration);
+            long vectorId = jsonNode.get("id").asLong();
+            JsonNode vectorArray = jsonNode.get("vector");
+            
+            if (vectorArray == null || !vectorArray.isArray()) {
+                return;
+            }
+
+            List<Float> floatValues = new ArrayList<>(vectorArray.size());
+            for (int i = 0; i < vectorArray.size(); i++) {
+                JsonNode element = vectorArray.get(i);
+                floatValues.add(element != null && element.isNumber() ? (float) element.asDouble() : 0.0f);
+            }
+
+            VectorMessage vectorMessage = VectorMessage.newBuilder()
+                    .setId(vectorId)
+                    .addAllValues(floatValues)
+                    .build();
+
+            // Direct transaction into C++ compute substrate via gRPC
+            IngestResponse response = blockingStub.ingestVectorStream(vectorMessage);
+            log.info("🚀 Core commit status: {} for node: {} [Cleared in {} ms]", 
+                    response.getStatus(), vectorId, (System.currentTimeMillis() - startTime));
+
+        } catch (Exception e) {
+            log.error("Pipeline processing degradation on record string segment. Exception context: ", e);
+            throw new RuntimeException("Triggering Kafka transaction retry block...", e); 
+        }
     }
 
     @PreDestroy
     public void shutdownChannel() {
         if (channel != null && !channel.isShutdown()) {
-            log.info("Closing IPC gRPC channel safely...");
+            log.info("Gracefully severing C++ IPC channel linkage...");
             channel.shutdown();
         }
     }

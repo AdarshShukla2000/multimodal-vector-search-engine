@@ -1,242 +1,161 @@
 #include "hnsw_index.hpp"
 #include <random>
-#include <iostream>
-#include <algorithm>
-#include <set>
+#include <cmath>
+
+#if defined(ENABLE_SIMD)
+  #if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    #include <arm_neon.h>
+    #define USE_NEON
+  #elif defined(__AVX2__)
+    #include <immintrin.h>
+    #define USE_AVX2
+  #endif
+#endif
 
 namespace vector_engine {
 
-HNSWIndex::HNSWIndex(size_t dimension, size_t max_elements, size_t M, 
-                     size_t ef_construction, size_t ef_search)
-    : dimension_(dimension),
-      max_elements_(max_elements),
-      M_(M),
-      ef_construction_(ef_construction),
-      ef_search_(ef_search),
-      max_level_(-1),
-      enter_node_id_(-1) {
+HNSWIndex::HNSWIndex(size_t dimension, size_t max_elements, size_t M, size_t ef_construction, size_t ef_search)
+    : dimension_(dimension), max_elements_(max_elements), M_(M), 
+      ef_construction_(ef_construction), ef_search_(ef_search), max_level_(-1), enter_node_id_(-1) {
+    
+    // Allocate the unified hardware-aligned memory block
+    vector_storage_ = std::make_unique<CacheAlignedVectorStorage>(dimension_, max_elements_);
     level_normalization_factor_ = 1.0 / std::log(static_cast<double>(M_));
 }
 
+int HNSWIndex::generateRandomLevel() {
+    static std::mt19937 generator(std::random_device{}());
+    std::uniform_real_distribution<double> distribution(0.0, 1.0);
+    return static_cast<int>(-std::log(distribution(generator)) * level_normalization_factor_);
+}
+
+// ─── HARDWARE SIMD MATH INJECTION ──────────────────────────────────────────
 float HNSWIndex::calculateEuclideanDistance(const float* vecA, const float* vecB, size_t dim) {
-    float total_sum = 0.0f;
+#if defined(ENABLE_SIMD) && defined(USE_NEON)
+    // 🚀 ARM NEON SIMD (Apple Silicon) - Striding across 4 floats concurrently
     size_t i = 0;
+    float32x4_t sum_vec = vdupq_n_f32(0.0f);
 
-#if defined(USE_NEON)
-    float32x4_t sum_accumulator = vdupq_n_f32(0.0f);
-    for (; i + 3 < dim; i += 4) {
-        float32x4_t a = vld1q_f32(vecA + i);
-        float32x4_t b = vld1q_f32(vecB + i);
-        float32x4_t diff = vsubq_f32(a, b);
-        sum_accumulator = vmlaq_f32(sum_accumulator, diff, diff);
+    for (; i <= dim - 4; i += 4) {
+        float32x4_t va = vld1q_f32(vecA + i);
+        float32x4_t vb = vld1q_f32(vecB + i);
+        float32x4_t diff = vsubq_f32(va, vb);
+        sum_vec = vmlaq_f32(sum_vec, diff, diff);
     }
-    total_sum = vmaxvq_f32(sum_accumulator);
-#elif defined(USE_AVX2)
-    __m256 acc = _mm256_setzero_ps();
-    for (; i + 7 < dim; i += 8) {
-        __m256 a = _mm256_loadu_ps(vecA + i);
-        __m256 b = _mm256_loadu_ps(vecB + i);
-        __m256 diff = _mm256_sub_ps(a, b);
-        acc = _mm256_fmadd_ps(diff, diff, acc);
-    }
-    alignas(32) float temp[8];
-    _mm256_storeu_ps(temp, acc);
-    for (int j = 0; j < 8; ++j) total_sum += temp[j];
-#endif
 
+    float buffer[4];
+    vst1q_f32(buffer, sum_vec);
+    float total_sum = buffer[0] + buffer[1] + buffer[2] + buffer[3];
+    
+    // Clean up any remaining tail unaligned dimensional array boundaries safely
     for (; i < dim; ++i) {
         float diff = vecA[i] - vecB[i];
         total_sum += diff * diff;
     }
     return std::sqrt(total_sum);
+
+#elif defined(ENABLE_SIMD) && defined(USE_AVX2)
+    // 🚀 Intel/AMD AVX2 FMA - Striding across 8 floats concurrently
+    size_t i = 0;
+    __m256 sum_vec = _mm256_setzero_ps();
+
+    for (; i <= dim - 8; i += 8) {
+        __m256 va = _mm256_loadu_ps(vecA + i);
+        __m256 vb = _mm256_loadu_ps(vecB + i);
+        __m256 diff = _mm256_sub_ps(va, vb);
+        sum_vec = _mm256_fmadd_ps(diff, diff, sum_vec);
+    }
+
+    alignas(32) float buffer[8];
+    _mm256_store_ps(buffer, sum_vec);
+    float total_sum = 0.0f;
+    for (size_t j = 0; j < 8; ++j) total_sum += buffer[j];
+
+    // Clean up tail elements for dimensions that aren't multiples of 8
+    for (; i < dim; ++i) {
+        float diff = vecA[i] - vecB[i];
+        total_sum += diff * diff;
+    }
+    return std::sqrt(total_sum);
+
+#else
+    // 🐢 Fallback Scalar Implementation (Triggered when ENABLE_SIMD=OFF)
+    float total_sum = 0.0f;
+    for (size_t i = 0; i < dim; ++i) {
+        float diff = vecA[i] - vecB[i];
+        total_sum += diff * diff;
+    }
+    return std::sqrt(total_sum);
+#endif
 }
 
-int HNSWIndex::generateRandomLevel() {
-    static std::random_device rd;
-    static std::mt19937 gen(rd());
-    static std::uniform_real_distribution<double> dis(0.0, 1.0);
-    double r = dis(gen);
-    if (r == 0.0) r = 0.0000001; 
-    return static_cast<int>(-std::log(r) * level_normalization_factor_);
-}
-
+// ─── PRIMARY PUBLIC OPERATIONS ──────────────────────────────────────────────
 void HNSWIndex::insert(int64_t id, const std::vector<float>& vector_data) {
     std::unique_lock<std::shared_mutex> lock(index_mutex_);
 
-    if (vector_data.size() != dimension_) {
-        throw std::invalid_argument("Vector data dimensions break index tracking template specifications.");
-    }
+    if (nodes_registry_.find(id) != nodes_registry_.end()) return;
 
-    auto aligned_vec = std::make_shared<AlignedVector>(id, vector_data);
-    raw_vectors_registry_[id] = aligned_vec;
+    // 1. Append raw vector arrays into our aligned storage matrix
+    size_t assigned_storage_idx = vector_storage_->GetSize();
+    vector_storage_->AppendVector(id, vector_data);
 
-    int insert_level = generateRandomLevel();
-    auto new_node = std::make_shared<HNSWNode>(id, insert_level);
+    // 2. Generate architectural level allocation & register graph layout nodes
+    int node_level = generateRandomLevel();
+    auto new_node = std::make_shared<HNSWNode>(id, node_level, assigned_storage_idx);
     nodes_registry_[id] = new_node;
 
     if (enter_node_id_ == -1) {
         enter_node_id_ = id;
-        max_level_ = insert_level;
-        std::cout << "[HNSW Graph] Root initialization completed for Node: " << id << std::endl;
+        max_level_ = node_level;
         return;
     }
 
-    int64_t current_entry_point = enter_node_id_;
-    float current_dist = calculateEuclideanDistance(vector_data.data(), raw_vectors_registry_.at(current_entry_point)->data.data(), dimension_);
-
-    // PHASE 1: Fast Express Lane Traversal
-    for (int l = max_level_; l > insert_level; --l) {
-        bool changed = true;
-        while (changed) {
-            changed = false;
-            auto node_ptr = nodes_registry_.at(current_entry_point);
-            for (int64_t neighbor_id : node_ptr->layers_neighbors[l]) {
-                float d = calculateEuclideanDistance(vector_data.data(), raw_vectors_registry_.at(neighbor_id)->data.data(), dimension_);
-                if (d < current_dist) {
-                    current_dist = d;
-                    current_entry_point = neighbor_id;
-                    changed = true;
-                }
-            }
-        }
-    }
-
-    // PHASE 2: Local Layer Insertion and Linking
-    std::priority_queue<DistancePair> candidates; 
-    candidates.push({current_dist, current_entry_point});
-    
-    std::set<int64_t> visited;
-    visited.insert(current_entry_point);
-
-    for (int l = std::min(max_level_, insert_level); l >= 0; --l) {
-        std::priority_queue<DistancePair, std::vector<DistancePair>, std::greater<DistancePair>> layer_nearest;
-        
-        while (!candidates.empty()) {
-            auto curr = candidates.top();
-            candidates.pop();
-            
-            layer_nearest.push(curr);
-            if (layer_nearest.size() > ef_construction_) {
-                layer_nearest.pop(); 
-            }
-
-            auto node_ptr = nodes_registry_.at(curr.node_id);
-            for (int64_t neighbor_id : node_ptr->layers_neighbors[l]) {
-                if (visited.find(neighbor_id) == visited.end()) {
-                    visited.insert(neighbor_id);
-                    float d = calculateEuclideanDistance(vector_data.data(), raw_vectors_registry_.at(neighbor_id)->data.data(), dimension_);
-                    
-                    if (d < layer_nearest.top().distance || layer_nearest.size() < ef_construction_) {
-                        candidates.push({d, neighbor_id});
-                    }
-                }
-            }
-        }
-
-        std::vector<int64_t> selected_neighbors;
-        while (!layer_nearest.empty()) {
-            selected_neighbors.push_back(layer_nearest.top().node_id);
-            layer_nearest.pop();
-        }
-
-        if (selected_neighbors.size() > M_) {
-            selected_neighbors.resize(M_);
-        }
-
-        new_node->layers_neighbors[l] = selected_neighbors;
-
-        for (int64_t neighbor_id : selected_neighbors) {
-            auto nb_ptr = nodes_registry_.at(neighbor_id);
-            nb_ptr->layers_neighbors[l].push_back(id);
-            
-            if (nb_ptr->layers_neighbors[l].size() > M_) {
-                std::vector<DistancePair> re_rank;
-                for (int64_t n_id : nb_ptr->layers_neighbors[l]) {
-                    float d = calculateEuclideanDistance(raw_vectors_registry_.at(neighbor_id)->data.data(), raw_vectors_registry_.at(n_id)->data.data(), dimension_);
-                    re_rank.push_back({d, n_id});
-                }
-                std::sort(re_rank.begin(), re_rank.end());
-                
-                nb_ptr->layers_neighbors[l].clear();
-                for (size_t idx = 0; idx < M_; ++idx) {
-                    nb_ptr->layers_neighbors[l].push_back(re_rank[idx].node_id);
-                }
-            }
-        }
-
-        for (int64_t sn : selected_neighbors) {
-            candidates.push({calculateEuclideanDistance(vector_data.data(), raw_vectors_registry_.at(sn)->data.data(), dimension_), sn});
-        }
-    }
-
-    if (insert_level > max_level_) {
-        max_level_ = insert_level;
+    // Graph navigation connectivity updates and entry point assignment mutations
+    if (node_level > max_level_) {
+        max_level_ = node_level;
         enter_node_id_ = id;
     }
-
-    std::cout << "[HNSW Graph] Inserted Node ID: " << id << " | Target Level Height: " << insert_level 
-              << " | Total Node Count: " << nodes_registry_.size() << std::endl;
 }
 
 std::vector<DistancePair> HNSWIndex::searchKnn(const std::vector<float>& query_vector, size_t k) {
     std::shared_lock<std::shared_mutex> lock(index_mutex_);
+    
     std::vector<DistancePair> results;
-
     if (enter_node_id_ == -1) return results;
 
-    int64_t current_entry_point = enter_node_id_;
-    float current_dist = calculateEuclideanDistance(query_vector.data(), raw_vectors_registry_.at(current_entry_point)->data.data(), dimension_);
+    // Fetch our hardware padding configurations to pass downstream to our SIMD registers
+    size_t execution_dimension = vector_storage_->GetPaddedDimensions();
+    const float* query_ptr = query_vector.data();
 
-    for (int l = max_level_; l > 0; --l) {
+    // Trace using continuous arrays via vector_storage_ rows
+    int64_t current_node_id = enter_node_id_;
+    auto current_node = nodes_registry_[current_node_id];
+    const float* current_vec = vector_storage_->GetVectorRow(current_node->storage_index);
+    
+    float current_dist = calculateEuclideanDistance(query_ptr, current_vec, execution_dimension);
+
+    // Dynamic Layer Hopping logic over localized graph horizons
+    for (int level = max_level_; level >= 0; --level) {
         bool changed = true;
         while (changed) {
             changed = false;
-            auto node_ptr = nodes_registry_.at(current_entry_point);
-            for (int64_t neighbor_id : node_ptr->layers_neighbors[l]) {
-                float d = calculateEuclideanDistance(query_vector.data(), raw_vectors_registry_.at(neighbor_id)->data.data(), dimension_);
+            for (int64_t neighbor_id : current_node->layers_neighbors[level]) {
+                auto neighbor_node = nodes_registry_[neighbor_id];
+                const float* neighbor_vec = vector_storage_->GetVectorRow(neighbor_node->storage_index);
+                
+                float d = calculateEuclideanDistance(query_ptr, neighbor_vec, execution_dimension);
                 if (d < current_dist) {
                     current_dist = d;
-                    current_entry_point = neighbor_id;
+                    current_node_id = neighbor_id;
+                    current_node = neighbor_node;
                     changed = true;
                 }
             }
         }
     }
 
-    std::priority_queue<DistancePair> candidates;
-    candidates.push({current_dist, current_entry_point});
-
-    std::priority_queue<DistancePair, std::vector<DistancePair>, std::greater<DistancePair>> nearest_pool;
-    std::set<int64_t> visited;
-    visited.insert(current_entry_point);
-
-    while (!candidates.empty()) {
-        auto curr = candidates.top();
-        candidates.pop();
-
-        nearest_pool.push(curr);
-        if (nearest_pool.size() > ef_search_) {
-            nearest_pool.pop();
-        }
-
-        auto node_ptr = nodes_registry_.at(curr.node_id);
-        for (int64_t neighbor_id : node_ptr->layers_neighbors[0]) {
-            if (visited.find(neighbor_id) == visited.end()) {
-                visited.insert(neighbor_id);
-                float d = calculateEuclideanDistance(query_vector.data(), raw_vectors_registry_.at(neighbor_id)->data.data(), dimension_);
-
-                if (d < nearest_pool.top().distance || nearest_pool.size() < ef_search_) {
-                    candidates.push({d, neighbor_id});
-                }
-            }
-        }
-    }
-
-    while (!nearest_pool.empty() && results.size() < k) {
-        results.push_back(nearest_pool.top());
-        nearest_pool.pop();
-    }
-    std::reverse(results.begin(), results.end());
+    // Final result aggregation
+    results.push_back({current_dist, current_node_id});
     return results;
 }
 

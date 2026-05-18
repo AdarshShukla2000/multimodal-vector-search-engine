@@ -1,89 +1,88 @@
+import grpc
 import time
 import random
 import concurrent.futures
 import numpy as np
-import grpc
 
-# Automatically compile or import your generated proto structures
-# Ensure your python path can see the compiled proto specs
-import vector_service_pb2 as pb2
-import vector_service_pb2_grpc as pb2_grpc
+# Import the stubs generated at your root directory
+import vector_service_pb2
+import vector_service_pb2_grpc
 
-SERVER_ADDRESS = "localhost:50051"
-DIMENSION = 128
-NUM_VECTORS = 1000
-NUM_QUERIES = 100
-K_NEIGHBORS = 5
+GRPC_SERVER_ADDRESS = "localhost:50051"
+DIMENSION = 384
+NUM_BENCHMARK_QUERIES = 10000  # Scaled up to cleanly measure sustained throughput
+CONCURRENCY_WORKERS = 32       # Generates enough pressure to saturate the 10 C++ core threads
 
-def generate_vector(dim):
-    # Create normalized float arrays to simulate true embedding spaces
-    vec = np.random.randn(dim).astype(np.float32)
-    norm = np.linalg.norm(vec)
-    return (vec / (norm if norm > 0 else 1.0)).tolist()
+def generate_random_vector(dim):
+    return [random.uniform(-1.0, 1.0) for _ in range(dim)]
 
-def run_ingestion_benchmark(stub):
-    print(f"📦 Starting Ingestion Benchmark of {NUM_VECTORS} vectors...")
-    vectors_pool = {i: generate_vector(DIMENSION) for i in range(1, NUM_VECTORS + 1)}
-    
+def send_query_request(stub, query_vec, k=10):
+    request = vector_service_pb2.QueryRequest(
+        query_vector=query_vec,
+        top_k=k
+    )
     start_time = time.perf_counter()
+    try:
+        response = stub.QueryNearestNeighbors(request)
+        latency = (time.perf_counter() - start_time) * 1000.0  # Calculate in milliseconds
+        return latency, True
+    except grpc.RpcError as e:
+        return 0.0, False
+
+def run_performance_suite():
+    print("======================================================================")
+    print("🏋️‍♂️  INITIATING END-TO-END HNSW ENGINE CONCURRENCY STRESS TEST")
+    print("======================================================================")
+    print(f"Target Endpoint : {GRPC_SERVER_ADDRESS}")
+    print(f"Load Parameters : {NUM_BENCHMARK_QUERIES} queries | {CONCURRENCY_WORKERS} parallel client channels\n")
     
-    # Use thread pool to simulate concurrent upstream microservice traffic
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-        futures = []
-        for vec_id, vec_data in vectors_pool.items():
-            req = pb2.VectorMessage(id=vec_id, values=vec_data)
-            futures.append(executor.submit(stub.IngestVectorStream, req))
-        
-        # Wait for all streams to clear out
-        concurrent.futures.wait(futures)
-            
-    end_time = time.perf_counter()
-    total_time = (end_time - start_time) * 1000
-    print(f"✅ Ingestion complete in {total_time:.2f} ms ({total_time/NUM_VECTORS:.2f} ms/vector)\n")
-    return vectors_pool
-
-def run_query_benchmark(stub, vectors_pool):
-    print(f"🔍 Running {NUM_QUERIES} Parallel KNN Queries (K={K_NEIGHBORS})...")
+    # Pre-generate vector matrices to keep Python generation out of the timing loop
+    print("📊 Pre-generating test datasets...")
+    query_vectors = [generate_random_vector(DIMENSION) for _ in range(NUM_BENCHMARK_QUERIES)]
+    
+    # Establish connection channel
+    channel = grpc.insecure_channel(GRPC_SERVER_ADDRESS)
+    stub = vector_service_pb2_grpc.VectorComputeEngineStub(channel)
+    
     latencies = []
+    success_count = 0
+    
+    print("🔥 Launching concurrent worker threads. Bombarding C++ compute engine...")
+    global_start = time.perf_counter()
+    
+    # Utilize Python's thread pool to simulate multi-client web-gateway traffic
+    with concurrent.futures.ThreadPoolExecutor(max_workers=CONCURRENCY_WORKERS) as executor:
+        futures = [executor.submit(send_query_request, stub, vec) for vec in query_vectors]
+        
+        for future in concurrent.futures.as_completed(futures):
+            latency, success = future.result()
+            if success:
+                latencies.append(latency)
+                success_count += 1
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-        futures = []
-        for _ in range(NUM_QUERIES):
-            query_vec = generate_vector(DIMENSION)
-            req = pb2.QueryRequest(query_vector=query_vec, top_k=K_NEIGHBORS)
-            
-            # Time the individual execution block with high-precision counters
-            start_query = time.perf_counter()
-            future = executor.submit(stub.QueryNearestNeighbors, req)
-            futures.append((future, start_query))
+    global_duration = time.perf_counter() - global_start
+    throughput = success_count / global_duration
 
-        for future, start_query in futures:
-            try:
-                response = future.result()
-                end_query = time.perf_counter()
-                if response.status == "SUCCESS":
-                    latencies.append((end_query - start_query) * 1000)
-            except Exception as e:
-                print(f"Query failure: {e}")
+    # Extract statistical percentiles
+    p50 = np.percentile(latencies, 50) if latencies else 0
+    p95 = np.percentile(latencies, 95) if latencies else 0
+    p99 = np.percentile(latencies, 99) if latencies else 0
+    avg_latency = np.mean(latencies) if latencies else 0
 
-    avg_latency = np.mean(latencies)
-    p95_latency = np.percentile(latencies, 95)
-    p99_latency = np.percentile(latencies, 99)
-
-    print(f"📊 --- SEARCH PERFORMANCE METRICS ---")
-    print(f"⏱️ Average Latency: {avg_latency:.3f} ms")
-    print(f"⚡ P95 Latency:     {p95_latency:.3f} ms")
-    print(f"🔥 P99 Latency:     {p99_latency:.3f} ms")
-    print(f"🚀 Max Throughput:  {int(1000 / avg_latency)} queries/sec")
+    print("\n📊 ─── SYSTEM BENCHMARK SUITE PERFORMANCE METRICS ───────────────────")
+    print(f"✅ Successful Requests   : {success_count}/{NUM_BENCHMARK_QUERIES}")
+    print(f"🚀 Measured Throughput   : {throughput:.2f} vectors/second")
+    print(f"⏱️  Average Latency       : {avg_latency:.2f} ms")
+    print(f"📉 p50 Percentile (Med)  : {p50:.2f} ms")
+    print(f"📉 p95 Percentile        : {p95:.2f} ms")
+    print(f"🔥 p99 Percentile (Max)  : {p99:.2f} ms")
+    print("──────────────────────────────────────────────────────────────────────")
+    
+    if throughput >= 10000 and p99 < 10.0:
+        print("🏆 VERIFICATION SUCCESS: Metrics validate resume performance claims!")
+    else:
+        print("⚠️  VERIFICATION NOTICE: Performance bounds out of target spectrum. Optimize graph parameters.")
+    print("======================================================================\n")
 
 if __name__ == "__main__":
-    # Ensure your C++ engine binary is actively running on port 50051 before executing
-    with grpc.insecure_channel(SERVER_ADDRESS) as channel:
-        stub = pb2_grpc.VectorComputeEngineStub(channel)
-        
-        # Compile python proto stubs dynamically if not pre-built
-        try:
-            pool = run_ingestion_benchmark(stub)
-            run_query_benchmark(stub, pool)
-        except grpc.RpcError as e:
-            print(f"\n❌ gRPC Communication breakdown. Is your C++ Engine running? Details: {e.details()}")
+    run_performance_suite()

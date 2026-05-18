@@ -6,6 +6,7 @@
 #include <shared_mutex>
 #include <memory>
 #include <cmath>
+#include "VectorStorage.hpp" // Link to your aligned memory storage structure
 
 // Architecture-specific vector optimization detection
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
@@ -19,30 +20,18 @@
 namespace vector_engine {
 
 /**
- * @brief Cache-aligned continuous structure to store raw vector data.
- * Crucial for avoiding split-cache-line performance degradation during SIMD loops.
- */
-struct alignas(64) AlignedVector {
-    std::vector<float> data;
-    int64_t id;
-
-    AlignedVector() : id(-1) {}
-    AlignedVector(int64_t node_id, const std::vector<float>& vec_data) 
-        : data(vec_data), id(node_id) {}
-};
-
-/**
- * @brief Represents a single element in our HNSW graph.
+ * @brief Represents a single structural node in our HNSW graph layout.
  */
 struct HNSWNode {
     int64_t id;
-    int level; // The maximum layer this node reaches
+    int level; 
+    size_t storage_index; // Maps this node to its data offset inside CacheAlignedVectorStorage
     
-    // Graph links layout: layers_neighbors[level_idx] = list of neighbor node IDs
+    // layers_neighbors[level_idx] = list of neighbor node IDs
     std::vector<std::vector<int64_t>> layers_neighbors;
 
-    HNSWNode(int64_t node_id, int max_level) 
-        : id(node_id), level(max_level), layers_neighbors(max_level + 1) {}
+    HNSWNode(int64_t node_id, int max_level, size_t internal_idx) 
+        : id(node_id), level(max_level), storage_index(internal_idx), layers_neighbors(max_level + 1) {}
 };
 
 /**
@@ -52,33 +41,28 @@ struct DistancePair {
     float distance;
     int64_t node_id;
 
-    bool operator>(const DistancePair& other) const {
-        return distance > other.distance; // Min-heap behavior
-    }
-    bool operator<(const DistancePair& other) const {
-        return distance < other.distance; // Max-heap behavior
-    }
+    bool operator>(const DistancePair& other) const { return distance > other.distance; }
+    bool operator<(const DistancePair& other) const { return distance < other.distance; }
 };
 
 class HNSWIndex {
 private:
-    // Core parameters configured at index creation
-    size_t dimension_;        // e.g., 128
-    size_t max_elements_;     // Upper limit of total indexed items
-    size_t M_;                // Max number of outgoing connections per node per layer
-    size_t ef_construction_;  // Size of dynamic candidate list during build phase
-    size_t ef_search_;        // Size of dynamic candidate list during query phase
+    size_t dimension_;        
+    size_t max_elements_;     
+    size_t M_;                
+    size_t ef_construction_;  
+    size_t ef_search_;        
     
     int max_level_;
-    int64_t enter_node_id_;   // The entry point node for graph traversal
+    int64_t enter_node_id_;   
     double level_normalization_factor_;
 
-    // Thread-safe storage structures
     std::shared_mutex index_mutex_;
     std::unordered_map<int64_t, std::shared_ptr<HNSWNode>> nodes_registry_;
-    std::unordered_map<int64_t, std::shared_ptr<AlignedVector>> raw_vectors_registry_;
+    
+    // Hardware-optimized continuous memory block
+    std::unique_ptr<CacheAlignedVectorStorage> vector_storage_;
 
-    // Internal Random Level Generator (similar to Skip-List design)
     int generateRandomLevel();
 
 public:
@@ -87,14 +71,12 @@ public:
     
     ~HNSWIndex() = default;
 
-    // Core SIMD Accelerated Vector Math
-    static float calculateEuclideanDistance(const float* vecA, const float* vecB, size_t dim);
+    // Core SIMD Accelerated Vector Math targeting cache-aligned strides
+    static inline float calculateEuclideanDistance(const float* vecA, const float* vecB, size_t dim);
 
-    // Primary Public API Operations
     void insert(int64_t id, const std::vector<float>& vector_data);
     std::vector<DistancePair> searchKnn(const std::vector<float>& query_vector, size_t k);
 
-    // Read-only inspection metrics for our analytical system dashboard
     size_t getIndexSize() { 
         std::lock_guard<std::shared_mutex> lock(index_mutex_);
         return nodes_registry_.size(); 

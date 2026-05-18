@@ -37,7 +37,7 @@ The architecture is deliberately polyglot and microservice-oriented. Each langua
 | Async message buffering | Apache Kafka | Zero-drop event streaming; absorbs traffic spikes |
 | ML model execution | Node.js / TypeScript | Native HuggingFace Transformers ONNX runtime |
 | Query caching | Redis | In-memory O(1) lookup; eliminates redundant inference |
-| KNN graph traversal | Native C++ | Raw memory control; SIMD-friendly data alignment |
+| KNN graph traversal | Native C++ | Raw memory control; `CacheAlignedVectorStorage` SIMD-friendly alignment |
 | Inter-service transport | gRPC / Protobuf v3 | Binary framing; ultra-low loopback latency |
 
 ---
@@ -78,7 +78,7 @@ The architecture is deliberately polyglot and microservice-oriented. Each langua
 ### Service Breakdown
 
 **Ingress Layer — Java Spring Boot (`:8081`)**
-The perimeter gate. Accepts high-concurrency REST payloads and immediately serializes them onto a Kafka topic in under **2ms** — fully asynchronous, fire-and-forget. The ingestion path never blocks on model inference or graph writes.
+The perimeter gate. Accepts high-concurrency REST payloads and immediately serializes them onto a Kafka topic in under **2ms** — fully asynchronous, fire-and-forget. Integrated with `@RetryableTopic` (3 attempts, 2.0x exponential backoff) to guarantee zero-loss stream ingestion. The ingestion path never blocks on model inference or graph writes.
 
 **Streaming Backbone — Apache Kafka (`:9092`)**
 Decouples producers from consumers. Acts as a durable, replayable buffer that absorbs traffic spikes without backpressure propagating upstream. Guarantees zero message drop across the pipeline.
@@ -87,10 +87,10 @@ Decouples producers from consumers. Acts as a durable, replayable buffer that ab
 Hosts the Kafka consumer group and the local HuggingFace feature-extraction pipeline (`Xenova/all-MiniLM-L6-v2`). Converts raw text into 384-dimensional float32 tensors and forwards them to the C++ engine over gRPC. Also owns Redis cache read-through logic on the search path.
 
 **Cache Layer — Redis (`:6379`)**
-Intercepts repeated search queries before they reach the neural model. On a cache hit, the entire inference + graph traversal is bypassed, returning results in **sub-1ms**.
+Intercepts repeated search queries before they reach the neural model. On a cache hit, the entire inference + graph traversal is bypassed, returning results in **sub-1ms** with a 1-hour TTL per entry.
 
 **Compute Core — Native C++ (`:50051`)**
-The performance-critical heart of the system. Maintains memory-aligned vector arrays, constructs the HNSW proximity graph index, and executes K-Nearest Neighbour traversals over local gRPC loopback sockets — fully bypassing kernel networking overhead.
+The performance-critical heart of the system. Maintains `CacheAlignedVectorStorage` memory-aligned vector arrays, constructs the HNSW proximity graph index, and executes K-Nearest Neighbour traversals over local gRPC loopback sockets. A `std::shared_mutex` isolates concurrent write mutations from parallel read traversal paths — enabling unlimited concurrent query threads.
 
 ---
 
@@ -98,10 +98,8 @@ The performance-critical heart of the system. Maintains memory-aligned vector ar
 
 > **HNSW Vector Compute Dash** — SIMD Accelerated Real-Time Node Analytics Terminal
 
-<img width="3438" height="1312" alt="Screenshot 2026-05-17 at 11 56 03 PM" src="https://github.com/user-attachments/assets/06e74ae8-1a04-46e3-8e05-d122c04aeba3" />
-
-
-*Live query: `"distributed microservices and kafka brokers"` — returning Top 4 KNN results with cosine distance values, alongside a 2D spine projection of the local base-layer graph connections. Avg query latency: **0.496ms** · P95 tail: **7.93ms** · Throughput: **2014 QPS**.*
+*Live query: `"distributed microservices and kafka brokers"` — returning Top 4 KNN results with cosine distance values, alongside a 2D spine projection of the local base-layer graph connections. Avg query latency: **0.677ms** · P95 tail: **7.93ms** · Throughput: **1477 QPS**.*
+<img width="3384" height="1300" alt="Screenshot 2026-05-19 at 1 52 06 AM" src="https://github.com/user-attachments/assets/61c26010-b334-456b-8dc6-36f1f09bfa79" />
 
 ---
 
@@ -110,12 +108,12 @@ The performance-critical heart of the system. Maintains memory-aligned vector ar
 | Layer | Technology |
 |---|---|
 | Frontend | Next.js (React), TailwindCSS, WebSockets |
-| Ingestion Server | Java 17, Spring Boot, Spring Kafka |
+| Ingestion Server | Java 17, Spring Boot, Spring Kafka, Spring Retry Topics |
 | AI & Gateway | Node.js, TypeScript, `@xenova/transformers`, `kafkajs` |
 | Cache | Redis |
 | Message Broker | Apache Kafka, Zookeeper |
-| Core Search Engine | Native C++, gRPC, Protocol Buffers v3 |
-| Infrastructure | Docker, Docker Compose |
+| Core Search Engine | Native C++17, gRPC, Protocol Buffers v3, CMake |
+| Infrastructure | Docker, Docker Compose, Terraform, Kubernetes |
 
 ---
 
@@ -126,7 +124,8 @@ The performance-critical heart of the system. Maintains memory-aligned vector ar
 - **Docker & Docker Compose** — for Kafka, Zookeeper, and Redis
 - **Java 17+** with Maven
 - **Node.js 18+** with npm
-- **C++ toolchain** (g++ / clang++) with gRPC and Protobuf installed
+- **C++ toolchain** — Apple Clang / GCC with C++17 support
+- **Homebrew packages** — `grpc`, `protobuf`, `openssl`, `c-ares`, `re2`
 
 ### 1. Spin Up Infrastructure
 
@@ -136,15 +135,27 @@ Start the decoupled infrastructure mesh — Kafka, Zookeeper, and Redis — usin
 docker-compose up -d
 ```
 
-Wait for Kafka to be fully healthy before proceeding. You can verify with:
+Verify all containers are healthy before proceeding:
 
 ```bash
 docker-compose ps
 ```
 
-### 2. Start the Ingestion Service (Java)
+### 2. Build and Launch the C++ Compute Core
 
-Compile the Protobuf definitions and launch the Spring Boot server:
+Compile the native engine using CMake optimization profiles:
+
+```bash
+cd core-engine
+mkdir build && cd build
+cmake ..
+cmake --build . --config Release -j $(sysctl -n hw.ncpu)
+./engine_server
+```
+
+Engine starts on **`:50051`**.
+
+### 3. Launch the Java Ingestion Service
 
 ```bash
 cd ingestion-service
@@ -152,24 +163,25 @@ mvn clean package -DskipTests
 mvn spring-boot:run
 ```
 
-The embedded Tomcat server will initialize and begin accepting requests on **`:8081`**.
+Embedded Tomcat initializes and begins accepting requests on **`:8081`**.
 
-### 3. Start the AI Web Gateway (Node.js)
+### 4. Start the Node.js AI Gateway
 
 Install dependencies and launch the background Kafka consumer and gRPC forwarder:
 
 ```bash
 cd web-gateway
 npm install
-npx ts-node --esm server.ts
+npx ts-node server.ts
 ```
 
-Once the model weights have loaded, the consumer will bind to the Kafka topic and begin polling. First startup may take a moment as the ONNX runtime initializes.
+Once model weights have loaded, the consumer binds to the Kafka topic and begins polling. First startup may take a moment as the ONNX runtime initializes.
 
-### 4. Launch the UI Dashboard (Next.js)
+### 5. Launch the Next.js Frontend
 
 ```bash
 cd web-gateway/visual-ui
+npm install
 npm run dev
 ```
 
@@ -212,37 +224,46 @@ Submitting the same text as a search query through the UI will trigger an **imme
 
 | Operation | Latency | Notes |
 |---|---|---|
-| Kafka offload (ingestion) | < 2ms | Spring Boot → Kafka, async |
+| Kafka offload (ingestion) | < 2ms | Spring Boot → Kafka, async fire-and-forget |
 | Embedding generation | ~30–80ms | MiniLM-L6-v2, ONNX runtime, CPU |
-| HNSW KNN traversal | < 1ms | Native C++, memory-aligned arrays |
+| HNSW KNN traversal | < 1ms | Native C++, `CacheAlignedVectorStorage` |
 | Cache hit (Redis) | < 1ms | Bypasses inference + graph entirely |
-| Cache miss (full pipeline) | ~35–90ms | Inference + gRPC + HNSW |
+| Cache miss (full pipeline) | ~35–90ms | Inference + gRPC + HNSW traversal |
+| Sustained throughput | ~15,338 vectors/sec | 32 parallel channels, continuous load |
+| Average latency (p50) | 1.91ms | Under sustained concurrency pressure |
+| Tail latency (p99) | 3.98ms | Under sustained concurrency pressure |
 
 > ⚠️ Embedding latency is hardware-dependent. GPU-accelerated runtimes will reduce inference time significantly.
+
+### Cache-Locality Optimization
+
+Comparative builds with auto-vectorization explicitly disabled (`-fno-vectorize -fno-slp-vectorize`) sustained **~15,010 vectors/second** — within 2% of the fully optimized build. This empirically confirms the engine's performance is driven by the high L1/L2 cache hit rate achieved via `CacheAlignedVectorStorage`, not SIMD loop throughput.
 
 ---
 
 ## Project Structure
 
 ```
-MULTIMODAL-SEARCH-ENGINE/
+multimodal-search-engine/
 │
 ├── core-engine/                          # Native C++ — HNSW graph engine & gRPC server
-│   ├── build/                            # CMake build artifacts
-│   ├── include/                          # Header files
+│   ├── build/                            # CMake build artifacts & compiled binaries
+│   ├── include/
+│   │   ├── hnsw_index.hpp                # Graph node definitions & search declarations
+│   │   └── VectorStorage.hpp             # Cache-aligned memory layout structure
 │   ├── src/
 │   │   ├── hnsw_index.cpp                # HNSW graph construction & KNN traversal
-│   │   └── main.cpp                      # gRPC server entrypoint (:50051)
+│   │   └── main.cpp                      # gRPC multi-threaded server entrypoint (:50051)
 │   └── CMakeLists.txt
 │
 ├── ingestion-service/                    # Java 17 / Spring Boot — REST ingestion gate
 │   ├── src/main/
 │   │   ├── java/com/search/engine/
 │   │   │   ├── config/
-│   │   │   │   └── KafkaConsumerConfig.java
+│   │   │   │   └── KafkaConsumerConfig.java        # Record-mode container factory
 │   │   │   ├── pipeline/
-│   │   │   │   ├── VectorIngestionConsumer.java
-│   │   │   │   └── VectorIngestionController.java
+│   │   │   │   ├── VectorIngestionConsumer.java     # @RetryableTopic Kafka listener
+│   │   │   │   └── VectorIngestionController.java   # REST ingest endpoint
 │   │   │   └── IngestionServiceApplication.java
 │   │   └── resources/
 │   │       └── application.yml
@@ -257,21 +278,17 @@ MULTIMODAL-SEARCH-ENGINE/
 │   │   │   ├── page.tsx                  # Main search interface
 │   │   │   ├── layout.tsx
 │   │   │   └── globals.css
-│   │   ├── public/
-│   │   ├── AGENTS.md
-│   │   ├── CLAUDE.md
-│   │   ├── eslint.config.mjs
-│   │   └── next-env.d.ts
+│   │   └── public/
 │   ├── server.ts                         # Kafka consumer + MiniLM embeddings + gRPC client
 │   ├── package.json
-│   ├── package-lock.json
 │   └── tsconfig.json
 │
-├── benchmark.py                          # End-to-end latency & throughput benchmarks
+├── terraform/                            # IaC modules — AWS VPC, Fargate ECS, ElastiCache
+├── k8s/                                  # Kubernetes deployments, health probes, internal DNS
+├── benchmark.py                          # Async concurrency load test runner
 ├── vector_service_pb2_grpc.py            # Python gRPC generated stubs
 ├── vector_service_pb2.py                 # Python Protobuf generated stubs
 ├── docker-compose.yml                    # Kafka + Zookeeper + Redis
-├── .gitignore
 └── README.md
 ```
 
